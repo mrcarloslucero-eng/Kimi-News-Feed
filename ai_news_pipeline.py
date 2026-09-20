@@ -41,6 +41,10 @@ MAX_STORIES_PER_CATEGORY = int(os.environ.get("MAX_STORIES_PER_CATEGORY", "3"))
 REQUEST_TIMEOUT = 30
 CACHE_FILE = os.environ.get("CACHE_FILE", "story_cache.json")
 
+ENABLE_EDITOR = os.environ.get("ENABLE_EDITOR", "1") == "1"
+ENABLE_RESEARCHER = os.environ.get("ENABLE_RESEARCHER", "1") == "1"
+ENABLE_CRITIC = os.environ.get("ENABLE_CRITIC", "1") == "1"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -243,6 +247,68 @@ def call_anthropic_api(prompt):
         return "[ERROR: Unexpected API response format - " + str(e) + "]"
 
 
+def select_top_stories_with_ai(stories, category, max_n):
+    """Editor agent: score all candidates and pick the best max_n for the brief."""
+    if len(stories) <= max_n:
+        return stories
+
+    candidates = "\n".join(
+        f"{i+1}. {s['title']} — {s['raw_summary'][:200]}"
+        for i, s in enumerate(stories)
+    )
+    prompt = ("You are the editor of a daily AI news briefing for smart everyday people who are NOT tech experts.\n\n"
+              f"CATEGORY: {category.upper()}\n\n"
+              f"Here are {len(stories)} candidate stories from the last 24 hours:\n\n{candidates}\n\n"
+              f"Pick the {max_n} most newsworthy stories for a general audience. Prioritize real-world impact "
+              "(money, privacy, jobs, daily life), genuine novelty, and conflict or controversy. "
+              "Avoid picking multiple stories about the same event.\n\n"
+              "Reply with ONLY a JSON object like: {\"picks\": [3, 1, 7]}")
+
+    raw = call_anthropic_api(prompt) if AI_PROVIDER != "openai" else call_openai_api(prompt)
+    picks = []
+    match = re.search(r'"picks"\s*:\s*\[([^\]]*)\]', raw)
+    if match:
+        for num in re.findall(r'\d+', match.group(1)):
+            i = int(num) - 1
+            if 0 <= i < len(stories) and i not in picks:
+                picks.append(i)
+    if not picks:
+        logger.warning(f"  Editor agent returned unparseable picks for {category}, using first {max_n}")
+        return stories[:max_n]
+    logger.info(f"  Editor agent picked {len(picks)}/{len(stories)} for {category}")
+    return [stories[i] for i in picks[:max_n]]
+
+
+def fetch_full_text(url):
+    """Researcher agent: pull the full article body, falling back to the RSS snippet."""
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded:
+            text = trafilatura.extract(downloaded)
+            if text and len(text) > 400:
+                return text[:8000]
+    except Exception as e:
+        logger.warning(f"  Could not fetch full text for {url[:60]}: {e}")
+    return ""
+
+
+def critique_with_ai(title, content, summary, category):
+    """Critic agent: tighten the summary, cut the cheese, verify against the source.
+    Returns the revised summary, or "SKIP" if the story is too thin to include."""
+    prompt = ("You are a ruthless editor reviewing a segment for a daily AI news briefing.\n\n"
+              f"CATEGORY: {category.upper()}\n"
+              f"TITLE: {title}\n"
+              f"SOURCE CONTENT: {content[:3500]}\n\n"
+              f"DRAFT SEGMENT:\n{summary}\n\n"
+              "Review the draft against the source. Fix anything the source does not support, "
+              "remove cheesy or hypey phrasing, and tighten the writing while keeping the "
+              "HOOK / THE DRAMA / WHY IT MATTERS / THE ANGLE section format.\n\n"
+              "If the underlying story is too thin or boring to be worth including, reply with exactly: SKIP\n"
+              "Otherwise reply with ONLY the revised segment.")
+    return call_anthropic_api(prompt) if AI_PROVIDER != "openai" else call_openai_api(prompt)
+
+
 def build_html_email(stories_by_category):
     now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
     html_content = ("<!DOCTYPE html>\n<html>\n<head>\n"
@@ -394,13 +460,31 @@ def main():
     for story in unique_stories:
         by_category[story['category']].append(story)
 
+    stories_to_summarize = []
+    if ENABLE_EDITOR:
+        logger.info("\nSelecting top stories (editor agent)...")
+        for category in ["datacenter", "regulation", "jobs", "general"]:
+            pool = by_category[category]
+            logger.info(f"  {category}: choosing {min(MAX_STORIES_PER_CATEGORY, len(pool))} of {len(pool)}")
+            stories_to_summarize.extend(
+                select_top_stories_with_ai(pool, category, MAX_STORIES_PER_CATEGORY)
+            )
+            time.sleep(1)
+    else:
+        for category in ["datacenter", "regulation", "jobs", "general"]:
+            stories_to_summarize.extend(by_category[category][:MAX_STORIES_PER_CATEGORY])
+
+    if ENABLE_RESEARCHER:
+        logger.info("\nFetching full article text (researcher agent)...")
+        for story in stories_to_summarize:
+            full_text = fetch_full_text(story['link'])
+            if len(full_text) > len(story['raw_summary']) + 200:
+                logger.info(f"  Full text: {story['title'][:55]}...")
+                story['raw_summary'] = full_text
+            time.sleep(0.5)
+
     logger.info("\nGenerating AI summaries...")
     logger.info(f"Using {AI_PROVIDER} - this may take a minute")
-
-    stories_to_summarize = []
-    for category in ["datacenter", "regulation", "jobs", "general"]:
-        top_stories = by_category[category][:MAX_STORIES_PER_CATEGORY]
-        stories_to_summarize.extend(top_stories)
 
     summary_cache = load_summary_cache()
 
@@ -411,10 +495,24 @@ def main():
             story['summary'] = cached_summary
         else:
             logger.info(f"[{i}/{len(stories_to_summarize)}] Summarizing: {story['title'][:55]}...")
-            story['summary'] = summarize_with_ai(story['title'], story['raw_summary'], story['category'])
-            summary_cache[story['hash']] = story['summary']
+            summary = summarize_with_ai(story['title'], story['raw_summary'], story['category'])
+            skip = False
+            if ENABLE_CRITIC and not summary.startswith("[ERROR"):
+                logger.info(f"  Critic agent reviewing...")
+                critique = critique_with_ai(story['title'], story['raw_summary'], summary, story['category'])
+                if critique.strip() == "SKIP":
+                    logger.info(f"  Critic agent cut this story: {story['title'][:55]}...")
+                    skip = True
+                elif not critique.startswith("[ERROR"):
+                    summary = critique
+            if skip:
+                story['summary'] = ""
+            else:
+                story['summary'] = summary
+                summary_cache[story['hash']] = summary
             time.sleep(1)
 
+    stories_to_summarize = [s for s in stories_to_summarize if s.get('summary')]
     save_summary_cache(summary_cache)
 
     logger.info("\nBuilding email...")
