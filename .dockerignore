@@ -1,0 +1,6 @@
+.git
+.env
+.gitignore.txt
+__pycache__
+story_cache.json
+*.pyc

@@ -1,4 +1,4 @@
-/.env
-/.gitignore.txt
-/requirements.txt
-/__pycache__
+.env
+.gitignore.txt
+__pycache__/
+story_cache.json
