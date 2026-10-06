@@ -28,7 +28,7 @@ from urllib3.util.retry import Retry
 # =============================================================================
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "sk-ant-your-anthropic-key-here")
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "anthropic")
-AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-6")
+AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5-5")
 
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -53,22 +53,23 @@ logger = logging.getLogger(__name__)
 
 FEEDS = {
     "datacenter": [
-        "https://www.datacenterknowledge.com/feed",
-        "https://www.theregister.com/data_centre/headlines.atom",
+        "https://www.datacenterknowledge.com/rss.xml",
+        "https://www.datacenterdynamics.com/en/rss/",
     ],
     "regulation": [
-        "https://www.politico.com/rss/technology.xml",
-        "https://www.euractiv.com/section/artificial-intelligence/feed/",
+        "https://rss.politico.com/technology.xml",
+        "https://news.google.com/rss/search?q=AI+regulation+when:1d&hl=en-US&gl=US&ceid=US:en",
     ],
     "jobs": [
-        "https://www.vox.com/recode/rss.xml",
-        "https://www.theguardian.com/technology/artificialintelligence/rss",
+        "https://news.google.com/rss/search?q=AI+(jobs+OR+layoffs+OR+workers)+when:1d&hl=en-US&gl=US&ceid=US:en",
     ],
     "general": [
-        "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml",
+        "https://www.theguardian.com/technology/artificialintelligenceai/rss",
+        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
         "https://arstechnica.com/tag/ai/feed/",
         "https://hnrss.org/newest?q=AI",
-        "https://www.anthropic.com/news/rss.xml",
+        # Anthropic has no official RSS feed; Google News covers its announcements
+        "https://news.google.com/rss/search?q=site:anthropic.com&hl=en-US&gl=US&ceid=US:en",
         "https://openai.com/news/rss.xml",
     ],
 }
@@ -229,9 +230,13 @@ def call_anthropic_api(prompt):
     }
     payload = {
         "model": AI_MODEL,
-        "max_tokens": 600,
+        "max_tokens": 1024,
         "messages": [{"role": "user", "content": prompt}]
     }
+    # Sonnet 5.5 thinks by default; "between_tools" turns extended thinking off
+    # (only Sonnet 5.5 accepts it, so other models are sent the plain request)
+    if AI_MODEL == "claude-sonnet-5-5":
+        payload["thinking"] = {"type": "between_tools"}
     try:
         response = REQUESTS_SESSION.post(
             "https://api.anthropic.com/v1/messages",
@@ -240,11 +245,14 @@ def call_anthropic_api(prompt):
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
-        return response.json()['content'][0]['text']
+        data = response.json()
+        if data.get('stop_reason') == "refusal":
+            return "[ERROR: Model declined - " + str(data.get('stop_details')) + "]"
+        return next(b['text'] for b in data['content'] if b['type'] == "text")
     except requests.exceptions.RequestException as e:
         return "[ERROR: API request failed - " + str(e) + "]"
-    except (KeyError, IndexError) as e:
-        return "[ERROR: Unexpected API response format - " + str(e) + "]"
+    except (KeyError, IndexError, StopIteration) as e:
+        return "[ERROR: Unexpected API response format - " + repr(e) + "]"
 
 
 def select_top_stories_with_ai(stories, category, max_n):
